@@ -1,68 +1,88 @@
+import argparse
+import requests
+import sys
+import os
+import queue
+import time
+import threading
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
-import requests
-import sys
-from threading import Thread
-import time, random
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
-
-maxthreads = 2  # maximum number of concurrent threads
-total_episodes = 2  # hold total number of operations
-total_seasons = 2
-all = {}  # global holding the current running threads
 
 
-def main(season, episode):
-    setup(season, episode)
+class SdarotDownloader():
+    def __init__(self, **kwargs):
+        self._TIMEOUT = 35
+        self.episode = 0
+        self.url = kwargs.get('url')
+        self._chrome_driver_path = kwargs.get('chrome_driver_path')
+        if self._chrome_driver_path is None:
+            self._chrome_driver_path = 'chromedriver'
+        self.season_to_download = kwargs.get('season_to_download')
+        self.download_path = kwargs.get("download_path")
+        self.seasons_count = 0
+        self.episodes_for_season = 0
 
+    def runner(self):
+        episodes = self.get_episodes_for_season()
+        print('Downloading TV show %s season %s total episodes %d' % (self.get_tv_show_name(), self.season_to_download, len(episodes)))
+        work = queue.Queue()
+        for k, v in episodes.items():
+            work.put(k)
 
-def setup(season, episode):
-    path = 'C:/Games/chromedriver.exe'
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    driver = webdriver.Chrome(executable_path=path, chrome_options=chrome_options)
-    url = 'https://sdarot.world/watch/204-%D7%96%D7%94%D7%95%D7%AA-%D7%91%D7%93%D7%95%D7%99%D7%94-alias/season/{}/episode/{}'.format(
-        season, episode)
-    driver.get(url)
-    timeout = 33
-    element_present = EC.presence_of_element_located((By.CLASS_NAME, 'vjs-tech'))
-    found = WebDriverWait(driver, timeout).until(element_present)
-    val = found.get_attribute('src')
-    print(val)
-    download_url(val, season, episode)
+        threads = []
+        for i in range(5):
+            t = threading.Thread(target=self.worker, args=(i, work))
+            t.start()
+            threads.append(t)
 
+        for thread in threads:
+            thread.join()
 
-def seasons_discovery(url):
-    response = requests.get(url)
-    html_content = response.text
-    soup = BeautifulSoup(html_content, 'lxml')
-    links = soup.find_all('a')
-    seasons = []
-    episodes = []
-    for link in links:
-        if link['href'].find("watch/") is not -1:
-            if link['href'].find("/season") is not -1:
-                if link['href'].find("/episode") is -1:
-                    seasons.append(link)
-                else:
-                    episodes.append(link)
-    print("Seasons found: %s" % len(seasons))
-    return seasons
+    def worker(self, id, work):
+        print(f"worker {id} started!")
+        while work:
+            self.downloader(work.get())
+        return
 
+    def get_download_link(self, episode):
+        link = urljoin(self.url, episode['href'])
+        chrome_driver_options = Options()
+        chrome_driver_options.add_argument("--headless")
+        print(link)
+        driver = webdriver.Chrome(executable_path=self._chrome_driver_path, chrome_options=chrome_driver_options)
+        driver.get(link)
+        element_present = EC.presence_of_element_located((By.CLASS_NAME, 'vjs-tech'))
+        element = WebDriverWait(driver, self._TIMEOUT).until(element_present)
+        download_link_url = element.get_attribute('src')
+        return download_link_url
 
-def episodes_discovery(url, seasons):
-    # response = requests.get(url)
-    # html_content = response.text
-    # soup = BeautifulSoup(html_content, 'lxml')
-    # links = soup.find_all('a')
-    seasons_dict = dict()
-    for season in seasons:
-        episodes = []
-        new_url = urljoin(url, season['href'])
+    def get_seasons(self):
+        response = requests.get(self.url)
+        html_content = response.text
+        soup = BeautifulSoup(html_content, 'lxml')
+        links = soup.find_all('a')
+        seasons = []
+        for link in links:
+            if link['href'].find("watch/") is not -1:
+                if link['href'].find("/season") is not -1:
+                    if link['href'].find("/episode") is -1:
+                        seasons.append(link)
+        print("Seasons found: %s" % len(seasons))
+        for season in seasons:
+            if season.text == self.season_to_download:
+                return season
+
+    def get_episodes_for_season(self):
+        sleep_before_download = 30
+        seasons_dict = dict()
+        episodes = dict()
+        season_to_download = self.get_seasons()
+        new_url = urljoin(self.url, season_to_download['href'])
         response = requests.get(new_url)
         html_content = response.text
         soup = BeautifulSoup(html_content, 'lxml')
@@ -70,61 +90,74 @@ def episodes_discovery(url, seasons):
         for link in links:
             if link['href'].find("watch/") is not -1:
                 if link['href'].find("/episode") is not -1:
-                    episodes.append(link)
-        seasons_dict[season] = episodes
-    for k, v in seasons_dict.items():
-        print("In season %s, found %d episodes" % (k.text, len(v)))
+                    episodes[link] = link['href']
+            seasons_dict[season_to_download] = episodes
+
+        for k, v in seasons_dict.items():
+            print("In season %s, found %d episodes" % (k.text, len(v)))
+
+        print('Sleeping for %d due to server limitations' % sleep_before_download)
+        time.sleep(sleep_before_download)
+        return episodes
+
+    def get_episodes_for_seasons(self, seasons):
+        seasons_dict = dict()
+        for season in seasons:
+            episodes = []
+            new_url = urljoin(self.url, season['href'])
+            response = requests.get(new_url)
+            html_content = response.text
+            soup = BeautifulSoup(html_content, 'lxml')
+            links = soup.find_all('a')
+            for link in links:
+                if link['href'].find("watch/") is not -1:
+                    if link['href'].find("/episode") is not -1:
+                        episodes.append(link)
+            seasons_dict[season] = episodes
+        for k, v in seasons_dict.items():
+            print("In season %s, found %d episodes" % (k.text, len(v)))
+
+    def get_tv_show_name(self):
+        response = requests.get(self.url)
+        html_content = response.text
+        soup = BeautifulSoup(html_content, 'lxml')
+        links = soup.find_all('section', {'class': "background rounded"})
+        for link in links:
+            names = link.find_all('h1')
+            for name in names:
+                return name.text.split(" / ")[1]
+
+    def downloader(self, episode):
+        download_path = os.path.join(self.download_path, "%s_season_%s" % (self.get_tv_show_name(), self.season_to_download))
+        if not os.path.exists(download_path):
+            os.makedirs(download_path)
+        file_name = os.path.join(download_path, r"%s_s%se%s.mp4" % (self.get_tv_show_name(), self.season_to_download, episode.text))
+        with open(file_name, "wb") as f:
+            print("Downloading %s" % file_name)
+            response = requests.get(self.get_download_link(episode), stream=True)
+            total_length = response.headers.get('content-length')
+
+            if total_length is None:  # no content length header
+                f.write(response.content)
+            else:
+                dl = 0
+                total_length = int(total_length)
+                for data in response.iter_content(chunk_size=4096):
+                    dl += len(data)
+                    f.write(data)
+                    done = int(50 * dl / total_length)
+                    sys.stdout.write("\r[%s%s]" % ('=' * done, ' ' * (50 - done)))
+                    sys.stdout.flush()
 
 
+def parse_args():
+    args_parser = argparse.ArgumentParser(description="Sdarot TV auto Downloader")
+    args_parser.add_argument("-u", "--url", help="TV show to download URL", type=str, required=True)
+    args_parser.add_argument("-c", "--chrome-driver-path", help="Executable Chrome driver path (only if it's not in PATH)", type=str)
+    args_parser.add_argument("-s", "--season-to-download", help="Season number to download", type=str, required=True)
+    args_parser.add_argument("-d", "--download-path", help="Season download path", type=str, required=True)
+    return args_parser.parse_args()
 
-def download_url(url, season, episode):
-    file_name = "alias_season%d_episode_%d.mp4" % (season, episode)
-    download_path = r'F:\TV Shows\alias\season 1\\'
-    with open(download_path + file_name, "wb") as f:
-        print("Downloading %s" % file_name)
-        response = requests.get(url, stream=True)
-        total_length = response.headers.get('content-length')
-
-        if total_length is None:  # no content length header
-            f.write(response.content)
-        else:
-            dl = 0
-            total_length = int(total_length)
-            for data in response.iter_content(chunk_size=4096):
-                dl += len(data)
-                f.write(data)
-                done = int(50 * dl / total_length)
-                sys.stdout.write("\r[%s%s]" % ('=' * done, ' ' * (50 - done)))
-                sys.stdout.flush()
-
-
-class Worker(Thread):
-    global all
-
-    def __init__(self, season, episode):
-        Thread.__init__(self)
-        self.all = all
-        self.episode = episode
-        self.season = season
-
-    def run(self):
-        time.sleep(random.randint(10, 100) / 1000.0)
-        main(self.season, self.episode)
-        print("id %d: " % self.episode, all.keys())
-        del all[self.episode]
-
-
-
-
-# ToDo: First version, next version to get input from user
-# for s in range(1, total_seasons):
-#     for e in range(19, 20):
-#         while (len(all) > maxthreads):
-#             time.sleep(.1)
-#
-#         all[e] = 1
-#         w = Worker(s, e)
-#         w.start()
-url = 'https://sdarot.world/watch/43-prison-break-%D7%A0%D7%9E%D7%9C%D7%98%D7%99%D7%9D'
-seasons = seasons_discovery(url)
-episodes_discovery(url, seasons)
+parsed_args = parse_args()
+sd = SdarotDownloader(**parsed_args.__dict__)
+sd.runner()
